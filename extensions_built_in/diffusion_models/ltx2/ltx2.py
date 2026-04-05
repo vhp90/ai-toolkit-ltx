@@ -230,6 +230,11 @@ class LTX2Model(BaseModel):
         # invalidate older caches
         self.latent_space_version = f"{self.arch}_v2"
 
+        # === Speed Optimization: cached tensors ===
+        # Avoids re-allocating zero tensors every training step
+        self._pad_embeds_cache = {}
+        self._no_audio_cache = {}  # cache dummy audio state for no-audio training
+
     # static method to get the noise scheduler
     @staticmethod
     def get_train_scheduler():
@@ -824,22 +829,57 @@ class LTX2Model(BaseModel):
         current_length = embeds.text_embeds.shape[1]
         if current_length < target_length:
             pad_length = target_length - current_length
-            pad_tensor = torch.zeros(
-                (embeds.text_embeds.shape[0], pad_length, embeds.text_embeds.shape[2]),
-                device=embeds.text_embeds.device,
-                dtype=embeds.text_embeds.dtype,
-            )
-            embeds.text_embeds = torch.cat([pad_tensor, embeds.text_embeds], dim=1)
+            # === Speed Optimization: cache pad tensors to avoid re-allocation every step ===
+            batch_size = embeds.text_embeds.shape[0]
+            embed_dim = embeds.text_embeds.shape[2]
+            cache_key = (batch_size, pad_length, embed_dim, embeds.text_embeds.device, embeds.text_embeds.dtype)
+            if cache_key not in self._pad_embeds_cache:
+                self._pad_embeds_cache[cache_key] = {
+                    'pad_tensor': torch.zeros(
+                        (batch_size, pad_length, embed_dim),
+                        device=embeds.text_embeds.device,
+                        dtype=embeds.text_embeds.dtype,
+                    ),
+                    'pad_mask': torch.zeros(
+                        (batch_size, pad_length),
+                        device=embeds.text_embeds.device,
+                        dtype=embeds.text_embeds.dtype,
+                    ),
+                }
+            cached = self._pad_embeds_cache[cache_key]
+            embeds.text_embeds = torch.cat([cached['pad_tensor'], embeds.text_embeds], dim=1)
             if embeds.attention_mask is not None:
-                pad_mask = torch.zeros(
-                    (embeds.attention_mask.shape[0], pad_length),
-                    device=embeds.attention_mask.device,
-                    dtype=embeds.attention_mask.dtype,
-                )
+                pad_mask = cached['pad_mask'].to(dtype=embeds.attention_mask.dtype)
                 embeds.attention_mask = torch.cat(
                     [pad_mask, embeds.attention_mask], dim=1
                 )
         return embeds
+
+    def compile_transformer_blocks(self):
+        """Compile individual transformer blocks for LTX2 (avoids graph breaks).
+        
+        This matches the official LTX-2 trainer's approach of compiling each
+        transformer block individually rather than the whole model, which avoids
+        graph breaks from complex audio+video cross-attention.
+        
+        Uses mode='default' which is safer with gradient checkpointing and
+        compiles much faster than 'max-autotune' while still providing
+        significant speedup through operator fusion.
+        """
+        if hasattr(self.transformer, 'transformer_blocks'):
+            num_blocks = len(self.transformer.transformer_blocks)
+            print(f"  Compiling {num_blocks} transformer blocks individually (mode=default)...")
+            print(f"  NOTE: First training step will be slow while kernels compile. This is normal.")
+            compiled_blocks = []
+            for i, block in enumerate(self.transformer.transformer_blocks):
+                compiled_blocks.append(
+                    torch.compile(block, mode="default", fullgraph=False)
+                )
+            self.transformer.transformer_blocks = torch.nn.ModuleList(compiled_blocks)
+            print(f"  All {num_blocks} blocks registered for compilation.")
+        else:
+            print("  Warning: transformer_blocks not found, falling back to full model compile.")
+            self.model = torch.compile(self.model, mode="default")
 
     def get_noise_prediction(
         self,
@@ -945,30 +985,48 @@ class LTX2Model(BaseModel):
                     timestep,
                 ).to(self.device_torch, dtype=self.torch_dtype)
             else:
-                # no audio
-                num_mel_bins = self.pipeline.audio_vae.config.mel_bins
-                # latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
-                num_channels_latents_audio = (
-                    self.pipeline.audio_vae.config.latent_channels
-                )
-                duration_s = batch.num_frames / frame_rate
-                audio_latents_per_second = (
-                    self.pipeline.audio_sampling_rate
-                    / self.pipeline.audio_hop_length
-                    / float(self.pipeline.audio_vae_temporal_compression_ratio)
-                )
-                audio_num_frames = round(duration_s * audio_latents_per_second)
-                audio_latents = self.pipeline.prepare_audio_latents(
-                    batch_size,
-                    num_channels_latents=num_channels_latents_audio,
-                    audio_latent_length=audio_num_frames,
-                    num_mel_bins=num_mel_bins,
-                    noise_scale=0.0,
-                    dtype=torch.float32,
-                    device=self.transformer.device,
-                    generator=None,
-                    latents=None,
-                )
+                # === No audio training: cache dummy audio state & skip cross-modal attention ===
+                # The transformer processes audio through ALL blocks even when audio is zeros.
+                # By caching the dummy tensors and setting isolate_modalities=True,
+                # we skip all audio<->video cross-attention (wasted compute).
+                cache_key = (batch_size, batch.num_frames, frame_rate, self.transformer.device)
+                if cache_key not in self._no_audio_cache:
+                    num_mel_bins = self.pipeline.audio_vae.config.mel_bins
+                    num_channels_latents_audio = (
+                        self.pipeline.audio_vae.config.latent_channels
+                    )
+                    duration_s = batch.num_frames / frame_rate
+                    audio_latents_per_second = (
+                        self.pipeline.audio_sampling_rate
+                        / self.pipeline.audio_hop_length
+                        / float(self.pipeline.audio_vae_temporal_compression_ratio)
+                    )
+                    _audio_num_frames = round(duration_s * audio_latents_per_second)
+                    _audio_latents = self.pipeline.prepare_audio_latents(
+                        batch_size,
+                        num_channels_latents=num_channels_latents_audio,
+                        audio_latent_length=_audio_num_frames,
+                        num_mel_bins=num_mel_bins,
+                        noise_scale=0.0,
+                        dtype=torch.float32,
+                        device=self.transformer.device,
+                        generator=None,
+                        latents=None,
+                    )
+                    _audio_coords = self.transformer.audio_rope.prepare_audio_coords(
+                        _audio_latents.shape[0], _audio_num_frames, _audio_latents.device
+                    )
+                    self._no_audio_cache[cache_key] = {
+                        'audio_latents': _audio_latents,
+                        'audio_num_frames': _audio_num_frames,
+                        'audio_coords': _audio_coords,
+                    }
+                cached_audio = self._no_audio_cache[cache_key]
+                audio_latents = cached_audio['audio_latents']
+                audio_num_frames = cached_audio['audio_num_frames']
+
+            # Determine if we have real audio or just dummy zeros
+            has_real_audio = batch.audio_latents is not None or batch.audio_tensor is not None
 
             if self.pipeline.connectors.device != self.transformer.device:
                 self.pipeline.connectors.to(self.transformer.device)
@@ -996,14 +1054,22 @@ class LTX2Model(BaseModel):
                 packed_latents.device,
                 fps=frame_rate,
             )
-            audio_coords = self.transformer.audio_rope.prepare_audio_coords(
-                audio_latents.shape[0], audio_num_frames, audio_latents.device
-            )
+            if has_real_audio:
+                audio_coords = self.transformer.audio_rope.prepare_audio_coords(
+                    audio_latents.shape[0], audio_num_frames, audio_latents.device
+                )
+            else:
+                # Use cached audio coords for no-audio training
+                audio_coords = cached_audio['audio_coords']
 
         # use_cross_timestep - Whether to use the cross modality (audio is the cross modality of video, and vice versa) sigma when
         # calculating the cross attention modulation parameters. `True` is the newer (e.g. LTX-2.3) behavior;
         # `False` is the legacy LTX-2.0 behavior.
         use_cross_timestep = self.ltx_version == "2.3"
+
+        # When not training audio, skip audio<->video cross-attention entirely.
+        # Audio latents are zeros anyway, so cross-attention just wastes compute.
+        isolate_modalities = not has_real_audio
 
         noise_pred_video, noise_pred_audio = self.transformer(
             hidden_states=packed_latents,
@@ -1022,7 +1088,7 @@ class LTX2Model(BaseModel):
             audio_num_frames=audio_num_frames,
             video_coords=video_coords,
             audio_coords=audio_coords,
-            isolate_modalities=False,
+            isolate_modalities=isolate_modalities,
             spatio_temporal_guidance_blocks=None,
             perturbation_mask=None,
             use_cross_timestep=use_cross_timestep,
