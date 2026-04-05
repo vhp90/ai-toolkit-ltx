@@ -1569,6 +1569,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
         torch.backends.cuda.enable_cudnn_sdp(True)
         torch.backends.cuda.enable_flash_sdp(True)
 
+        # === Speed Optimization: SageAttention 2 backend ===
+        # SageAttention uses INT8/FP8 quantized attention kernels — 2-3x faster than SDPA.
+        # This is the single biggest speed win for transformer training.
+        try:
+            from diffusers.utils import is_sageattention_available, is_sageattention_version
+            if is_sageattention_available() and is_sageattention_version(">=", "2.1.1"):
+                import os
+                os.environ['DIFFUSERS_ATTN_BACKEND'] = 'sage'
+                print_acc("=" * 60)
+                print_acc("SageAttention 2 enabled — using INT8/FP8 quantized attention")
+                print_acc("This provides 2-3x faster attention vs standard SDPA")
+                print_acc("=" * 60)
+            else:
+                # Try FlashAttention as fallback
+                from diffusers.utils import is_flash_attn_available
+                if is_flash_attn_available():
+                    os.environ['DIFFUSERS_ATTN_BACKEND'] = 'flash'
+                    print_acc("FlashAttention enabled for optimized attention")
+        except Exception as e:
+            print_acc(f"Could not set optimized attention backend: {e}")
+
         params = []
 
         ### HOOK ###
