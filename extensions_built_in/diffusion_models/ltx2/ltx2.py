@@ -656,8 +656,8 @@ class LTX2Model(BaseModel):
                 repo_id="Lightricks/LTX-2.3",
                 filename="ltx-2.3-22b-distilled-lora-384.safetensors",
             )
-            from toolkit.print_util import print_acc
-            print_acc(f"Loading distilled LoRA from: {distilled_path}")
+            
+            print(f"Loading distilled LoRA from: {distilled_path}")
             raw_sd = load_file(distilled_path)
 
             # Convert from original LTX format to diffusers key naming
@@ -701,12 +701,12 @@ class LTX2Model(BaseModel):
                 weight_deltas[param_path] = delta
 
             self._distilled_lora_cache = weight_deltas
-            print_acc(f"Distilled LoRA cached: {len(weight_deltas)} weight deltas ({skipped} skipped)")
+            print(f"Distilled LoRA cached: {len(weight_deltas)} weight deltas ({skipped} skipped)")
             return weight_deltas
         except Exception as e:
-            from toolkit.print_util import print_acc
-            print_acc(f"WARNING: Failed to load distilled LoRA: {e}")
-            print_acc("Falling back to standard sampling (no distilled acceleration)")
+            
+            print(f"WARNING: Failed to load distilled LoRA: {e}")
+            print("Falling back to standard sampling (no distilled acceleration)")
             return None
 
     def _fuse_distilled_weights(self, weight_deltas):
@@ -807,23 +807,23 @@ class LTX2Model(BaseModel):
             distilled_deltas = self._load_distilled_lora_deltas()
             if distilled_deltas is not None:
                 try:
-                    from toolkit.print_util import print_acc
-                    print_acc("\n" + "="*55)
-                    print_acc("🚀 ACCELERATED SAMPLING MODE (LTX 2.3 Distilled LoRA)")
-                    print_acc("="*55)
-                    print_acc("Fusing distilled LoRA weights...")
+                    
+                    print("\n" + "="*55)
+                    print("🚀 ACCELERATED SAMPLING MODE (LTX 2.3 Distilled LoRA)")
+                    print("="*55)
+                    print("Fusing distilled LoRA weights...")
                     self._fuse_distilled_weights(distilled_deltas)
                     use_distilled = True
-                    print_acc("Config OVERRIDDEN to match distilled requirements:")
-                    print_acc("   - Steps          : 8 (Official Distilled Schedule)")
-                    print_acc(f"   - Dev Config Set : {gen_config.num_inference_steps} (IGNORED in accelerated mode)")
-                    print_acc("   - Guidance (CFG) : 1.0 (Disabled)")
-                    print_acc("   - STG Scale      : 0.0 (Disabled)")
-                    print_acc("="*55 + "\n")
+                    print("Config OVERRIDDEN to match distilled requirements:")
+                    print("   - Steps          : 8 (Official Distilled Schedule)")
+                    print(f"   - Dev Config Set : {gen_config.num_inference_steps} (IGNORED in accelerated mode)")
+                    print("   - Guidance (CFG) : 1.0 (Disabled)")
+                    print("   - STG Scale      : 0.0 (Disabled)")
+                    print("="*55 + "\n")
                 except Exception as e:
-                    from toolkit.print_util import print_acc
-                    print_acc(f"\n⚠️ WARNING: Failed to fuse distilled LoRA: {e}")
-                    print_acc("Falling back to STANDARD sampling.\n")
+                    
+                    print(f"\n⚠️ WARNING: Failed to fuse distilled LoRA: {e}")
+                    print("Falling back to STANDARD sampling.\n")
                     use_distilled = False
 
         if use_distilled:
@@ -870,16 +870,16 @@ class LTX2Model(BaseModel):
             )
         else:
             # Standard sampling with full guidance
-            from toolkit.print_util import print_acc
-            print_acc("\n" + "="*55)
-            print_acc("🐢 STANDARD SAMPLING MODE (No Distilled LoRA)")
-            print_acc("="*55)
-            print_acc("Using User/GUI Configuration:")
-            print_acc(f"   - Steps          : {gen_config.num_inference_steps}")
-            print_acc(f"   - Guidance (CFG) : {gen_config.guidance_scale}")
+            
+            print("\n" + "="*55)
+            print("🐢 STANDARD SAMPLING MODE (No Distilled LoRA)")
+            print("="*55)
+            print("Using User/GUI Configuration:")
+            print(f"   - Steps          : {gen_config.num_inference_steps}")
+            print(f"   - Guidance (CFG) : {gen_config.guidance_scale}")
             if self.ltx_version == "2.3":
-                print_acc("   - STG Scale      : 1.0")
-            print_acc("="*55 + "\n")
+                print("   - STG Scale      : 1.0")
+            print("="*55 + "\n")
 
             if self.ltx_version == "2.3":
                 extra["stg_scale"] = 1.0
@@ -924,8 +924,8 @@ class LTX2Model(BaseModel):
             try:
                 self._unfuse_distilled_weights(distilled_deltas)
             except Exception as e:
-                from toolkit.print_util import print_acc
-                print_acc(f"WARNING: Failed to unfuse distilled LoRA: {e}")
+                
+                print(f"WARNING: Failed to unfuse distilled LoRA: {e}")
 
         if self.low_vram:
             # Restore no tiling
