@@ -838,11 +838,7 @@ class LTX2Model(BaseModel):
             extra["spatio_temporal_guidance_blocks"] = []
             extra["use_cross_timestep"] = True
             # Use the official distilled sigma schedule instead of num_inference_steps
-            distilled_sigmas = torch.tensor(
-                LTX2_DISTILLED_SIGMA_VALUES,
-                device=self.device_torch,
-                dtype=self.torch_dtype,
-            )
+            distilled_sigmas = LTX2_DISTILLED_SIGMA_VALUES
 
             video, audio = pipeline(
                 prompt_embeds=conditional_embeds.text_embeds.to(
