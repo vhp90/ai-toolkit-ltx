@@ -56,6 +56,11 @@ except ImportError as e:
     )
 
 
+# Official distilled sigma schedule from Lightricks (8 denoising steps)
+# These are tuned to match the distillation process and produce equivalent quality
+# to 25-30 step generation with the dev model.
+LTX2_DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
 scheduler_config = {
     "base_image_seq_len": 1024,
     "base_shift": 0.95,
@@ -234,6 +239,10 @@ class LTX2Model(BaseModel):
         # Avoids re-allocating zero tensors every training step
         self._pad_embeds_cache = {}
         self._no_audio_cache = {}  # cache dummy audio state for no-audio training
+
+        # === Distilled LoRA for fast sample generation ===
+        # Cached state dict to avoid reloading 7.6GB file every sample step
+        self._distilled_lora_cache = None
 
     # static method to get the noise scheduler
     @staticmethod
@@ -628,6 +637,92 @@ class LTX2Model(BaseModel):
 
         return pipeline
 
+    def _load_distilled_lora_deltas(self):
+        """Load, convert, and pre-compute the distilled LoRA weight deltas.
+
+        Instead of using PEFT (which wraps Linear layers and breaks torch.compile),
+        we pre-compute the weight deltas: delta = lora_B @ lora_A for each target module.
+        These deltas can be directly added to / subtracted from model parameters
+        without changing the module structure, keeping compiled graphs intact.
+
+        Returns:
+            dict mapping model parameter paths to delta tensors, or None on failure.
+        """
+        if self._distilled_lora_cache is not None:
+            return self._distilled_lora_cache
+
+        try:
+            distilled_path = huggingface_hub.hf_hub_download(
+                repo_id="Lightricks/LTX-2.3",
+                filename="ltx-2.3-22b-distilled-lora-384.safetensors",
+            )
+            from toolkit.print_util import print_acc
+            print_acc(f"Loading distilled LoRA from: {distilled_path}")
+            raw_sd = load_file(distilled_path)
+
+            # Convert from original LTX format to diffusers key naming
+            converted = convert_lora_original_to_diffusers(raw_sd, version=self.ltx_version)
+
+            # Strip the "diffusion_model." prefix to get model-relative paths
+            # Keys look like: "diffusion_model.time_embed.linear.lora_A.weight"
+            # We need:        "time_embed.linear" as the module path
+            lora_pairs = {}  # module_path -> {"lora_A": tensor, "lora_B": tensor}
+            for k, v in converted.items():
+                # Remove "diffusion_model." prefix
+                rel_key = k.replace("diffusion_model.", "")
+                if ".lora_A.weight" in rel_key:
+                    module_path = rel_key.replace(".lora_A.weight", "")
+                    lora_pairs.setdefault(module_path, {})["lora_A"] = v
+                elif ".lora_B.weight" in rel_key:
+                    module_path = rel_key.replace(".lora_B.weight", "")
+                    lora_pairs.setdefault(module_path, {})["lora_B"] = v
+
+            # Pre-compute weight deltas: delta = lora_B @ lora_A
+            # Map them to the actual model parameter path: "{module_path}.weight"
+            weight_deltas = {}
+            transformer = unwrap_model(self.model)
+            skipped = 0
+            for module_path, pair in lora_pairs.items():
+                if "lora_A" not in pair or "lora_B" not in pair:
+                    skipped += 1
+                    continue
+                param_path = f"{module_path}.weight"
+                # Verify the parameter exists in the model
+                try:
+                    param = transformer.get_parameter(param_path)
+                except AttributeError:
+                    skipped += 1
+                    continue
+
+                lora_A = pair["lora_A"].to(dtype=param.dtype, device="cpu")
+                lora_B = pair["lora_B"].to(dtype=param.dtype, device="cpu")
+                # Compute delta and store on CPU to save VRAM
+                delta = (lora_B @ lora_A).to(dtype=param.dtype)
+                weight_deltas[param_path] = delta
+
+            self._distilled_lora_cache = weight_deltas
+            print_acc(f"Distilled LoRA cached: {len(weight_deltas)} weight deltas ({skipped} skipped)")
+            return weight_deltas
+        except Exception as e:
+            from toolkit.print_util import print_acc
+            print_acc(f"WARNING: Failed to load distilled LoRA: {e}")
+            print_acc("Falling back to standard sampling (no distilled acceleration)")
+            return None
+
+    def _fuse_distilled_weights(self, weight_deltas):
+        """Add pre-computed distilled LoRA deltas to the transformer weights in-place."""
+        transformer = unwrap_model(self.model)
+        for param_path, delta in weight_deltas.items():
+            param = transformer.get_parameter(param_path)
+            param.data.add_(delta.to(device=param.device, dtype=param.dtype))
+
+    def _unfuse_distilled_weights(self, weight_deltas):
+        """Subtract pre-computed distilled LoRA deltas from the transformer weights in-place."""
+        transformer = unwrap_model(self.model)
+        for param_path, delta in weight_deltas.items():
+            param = transformer.get_parameter(param_path)
+            param.data.sub_(delta.to(device=param.device, dtype=param.dtype))
+
     def generate_single_image(
         self,
         pipeline: LTX2Pipeline,
@@ -689,14 +784,6 @@ class LTX2Model(BaseModel):
 
         if self.low_vram:
             # set vae to tile decode
-            # pipeline.vae.enable_tiling(
-            #     tile_sample_min_height=256,
-            #     tile_sample_min_width=256,
-            #     tile_sample_min_num_frames=8,
-            #     tile_sample_stride_height=224,
-            #     tile_sample_stride_width=224,
-            #     tile_sample_stride_num_frames=4,
-            # )
             self.pipeline.vae.tile_sample_min_num_frames = 16
             self.pipeline.vae.tile_sample_stride_num_frames = 8
             self.pipeline.vae.use_framewise_decoding = True
@@ -705,46 +792,143 @@ class LTX2Model(BaseModel):
         conditional_embeds = self.pad_embeds(conditional_embeds)
         unconditional_embeds = self.pad_embeds(unconditional_embeds)
 
+        # === Distilled LoRA acceleration for LTX 2.3 ===
+        # Load the official distilled LoRA for ~6x faster sample generation.
+        # Uses 8 steps with no guidance instead of 25 steps with CFG+STG.
+        # This does NOT affect training — only the sampling/preview pipeline.
+        #
+        # We use MANUAL weight fusing (direct param.data.add_/sub_) instead of
+        # PEFT (load_lora_weights/fuse_lora) to avoid changing the module structure.
+        # PEFT wraps Linear layers with LoraLayer wrappers, which would force
+        # torch.compile to retrace the entire computation graph.
+        use_distilled = False
+        distilled_deltas = None
         if self.ltx_version == "2.3":
-            extra["stg_scale"] = 1.0
-            extra["modality_scale"] = 3.0
-            extra["guidance_rescale"] = 0.7
-            extra["audio_guidance_scale"] = 7.0
-            extra["audio_stg_scale"] = 1.0
-            extra["audio_modality_scale"] = 3.0
-            extra["audio_guidance_rescale"] = 0.7
-            extra["spatio_temporal_guidance_blocks"] = [28]
-            extra["use_cross_timestep"] = (
-                True  # they dont set this in some examples in diffusers, but I believe it should always be true for 2.3
+            distilled_deltas = self._load_distilled_lora_deltas()
+            if distilled_deltas is not None:
+                try:
+                    from toolkit.print_util import print_acc
+                    print_acc("\n" + "="*55)
+                    print_acc("🚀 ACCELERATED SAMPLING MODE (LTX 2.3 Distilled LoRA)")
+                    print_acc("="*55)
+                    print_acc("Fusing distilled LoRA weights...")
+                    self._fuse_distilled_weights(distilled_deltas)
+                    use_distilled = True
+                    print_acc("Config OVERRIDDEN to match distilled requirements:")
+                    print_acc("   - Steps          : 8 (Official Distilled Schedule)")
+                    print_acc(f"   - Dev Config Set : {gen_config.num_inference_steps} (IGNORED in accelerated mode)")
+                    print_acc("   - Guidance (CFG) : 1.0 (Disabled)")
+                    print_acc("   - STG Scale      : 0.0 (Disabled)")
+                    print_acc("="*55 + "\n")
+                except Exception as e:
+                    from toolkit.print_util import print_acc
+                    print_acc(f"\n⚠️ WARNING: Failed to fuse distilled LoRA: {e}")
+                    print_acc("Falling back to STANDARD sampling.\n")
+                    use_distilled = False
+
+        if use_distilled:
+            # Distilled mode: no guidance needed, use official sigma schedule
+            extra["stg_scale"] = 0.0
+            extra["modality_scale"] = 1.0
+            extra["guidance_rescale"] = 0.0
+            extra["audio_guidance_scale"] = 1.0
+            extra["audio_stg_scale"] = 0.0
+            extra["audio_modality_scale"] = 1.0
+            extra["audio_guidance_rescale"] = 0.0
+            extra["spatio_temporal_guidance_blocks"] = []
+            extra["use_cross_timestep"] = True
+            # Use the official distilled sigma schedule instead of num_inference_steps
+            distilled_sigmas = torch.tensor(
+                LTX2_DISTILLED_SIGMA_VALUES,
+                device=self.device_torch,
+                dtype=self.torch_dtype,
             )
 
-        video, audio = pipeline(
-            prompt_embeds=conditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            prompt_attention_mask=conditional_embeds.attention_mask.to(
-                self.device_torch
-            ),
-            negative_prompt_embeds=unconditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
-                self.device_torch
-            ),
-            height=gen_config.height,
-            width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            guidance_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            num_frames=gen_config.num_frames,
-            generator=generator,
-            return_dict=False,
-            output_type="np" if is_video else "pil",
-            **extra,
-        )
+            video, audio = pipeline(
+                prompt_embeds=conditional_embeds.text_embeds.to(
+                    self.device_torch, dtype=self.torch_dtype
+                ),
+                prompt_attention_mask=conditional_embeds.attention_mask.to(
+                    self.device_torch
+                ),
+                negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+                    self.device_torch, dtype=self.torch_dtype
+                ),
+                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
+                    self.device_torch
+                ),
+                height=gen_config.height,
+                width=gen_config.width,
+                sigmas=distilled_sigmas,
+                guidance_scale=1.0,
+                latents=gen_config.latents,
+                num_frames=gen_config.num_frames,
+                generator=generator,
+                return_dict=False,
+                output_type="np" if is_video else "pil",
+                **extra,
+            )
+        else:
+            # Standard sampling with full guidance
+            from toolkit.print_util import print_acc
+            print_acc("\n" + "="*55)
+            print_acc("🐢 STANDARD SAMPLING MODE (No Distilled LoRA)")
+            print_acc("="*55)
+            print_acc("Using User/GUI Configuration:")
+            print_acc(f"   - Steps          : {gen_config.num_inference_steps}")
+            print_acc(f"   - Guidance (CFG) : {gen_config.guidance_scale}")
+            if self.ltx_version == "2.3":
+                print_acc("   - STG Scale      : 1.0")
+            print_acc("="*55 + "\n")
+
+            if self.ltx_version == "2.3":
+                extra["stg_scale"] = 1.0
+                extra["modality_scale"] = 3.0
+                extra["guidance_rescale"] = 0.7
+                extra["audio_guidance_scale"] = 7.0
+                extra["audio_stg_scale"] = 1.0
+                extra["audio_modality_scale"] = 3.0
+                extra["audio_guidance_rescale"] = 0.7
+                extra["spatio_temporal_guidance_blocks"] = [28]
+                extra["use_cross_timestep"] = True
+
+            video, audio = pipeline(
+                prompt_embeds=conditional_embeds.text_embeds.to(
+                    self.device_torch, dtype=self.torch_dtype
+                ),
+                prompt_attention_mask=conditional_embeds.attention_mask.to(
+                    self.device_torch
+                ),
+                negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+                    self.device_torch, dtype=self.torch_dtype
+                ),
+                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
+                    self.device_torch
+                ),
+                height=gen_config.height,
+                width=gen_config.width,
+                num_inference_steps=gen_config.num_inference_steps,
+                guidance_scale=gen_config.guidance_scale,
+                latents=gen_config.latents,
+                num_frames=gen_config.num_frames,
+                generator=generator,
+                return_dict=False,
+                output_type="np" if is_video else "pil",
+                **extra,
+            )
+
+        # === Unfuse distilled LoRA after sampling ===
+        # Subtract the pre-computed weight deltas to restore original training weights.
+        # No module structure changes = torch.compile graphs remain valid.
+        if use_distilled and distilled_deltas is not None:
+            try:
+                self._unfuse_distilled_weights(distilled_deltas)
+            except Exception as e:
+                from toolkit.print_util import print_acc
+                print_acc(f"WARNING: Failed to unfuse distilled LoRA: {e}")
+
         if self.low_vram:
             # Restore no tiling
-            # pipeline.vae.use_tiling = False
             self.pipeline.vae.use_framewise_decoding = False
 
         if is_video:
